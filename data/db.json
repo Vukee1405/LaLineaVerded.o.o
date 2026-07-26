@@ -1,0 +1,47 @@
+[
+  {
+    "id": "seed-4",
+    "datum": "2026-07-08",
+    "vrsta": "cista",
+    "tezina": 195,
+    "napomena": "Standardna bala",
+    "korisnik": "Dragan",
+    "vremeUnosa": "2026-07-08T10:00:00.000Z"
+  },
+  {
+    "id": "seed-5",
+    "datum": "2026-07-10",
+    "vrsta": "primese",
+    "tezina": 145,
+    "napomena": "Ostecena folija",
+    "korisnik": "Marko",
+    "vremeUnosa": "2026-07-10T15:30:00.000Z"
+  },
+  {
+    "id": "seed-6",
+    "datum": "2026-07-12",
+    "vrsta": "cista",
+    "tezina": 220,
+    "napomena": "Standardna bala",
+    "korisnik": "Dragan",
+    "vremeUnosa": "2026-07-12T11:20:00.000Z"
+  },
+  {
+    "id": "seed-7",
+    "datum": "2026-07-15",
+    "vrsta": "primese",
+    "tezina": 110,
+    "napomena": "Ostalo",
+    "korisnik": "Zoran",
+    "vremeUnosa": "2026-07-15T09:10:00.000Z"
+  },
+  {
+    "id": "seed-8",
+    "datum": "2026-07-18",
+    "vrsta": "cista",
+    "tezina": 205,
+    "napomena": "Standardna bala",
+    "korisnik": "Marko",
+    "vremeUnosa": "2026-07-18T13:40:00.000Z"
+  }
+]

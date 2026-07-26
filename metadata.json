@@ -1,0 +1,6 @@
+{
+  "name": "La Linea Verde - Evidencija folije",
+  "description": "Modern PWA aplikacija za evidenciju potrošnje folije u proizvodnji za kompaniju La Linea Verde",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
