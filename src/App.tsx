@@ -125,8 +125,11 @@ export default function App() {
         }
       }
 
-      // Master list is serverEntries merged with any remaining pendingSync
+      // Master list merges localCache, serverEntries, and pendingSync
       const entryMap = new Map<string, BalaEntry>();
+      localCache.forEach((item) => {
+        if (item && item.id && !deletedIds.has(item.id)) entryMap.set(item.id, item);
+      });
       serverEntries.forEach((item) => {
         if (item && item.id && !deletedIds.has(item.id)) entryMap.set(item.id, item);
       });
@@ -169,10 +172,10 @@ export default function App() {
     window.addEventListener('online', handleOnline);
     document.addEventListener('visibilitychange', handleVisibility);
 
-    // Periodic poll every 2s to ensure Director & Operators see all updates instantly
+    // Periodic poll every 4s to ensure Director & Operators see all updates seamlessly
     const pollInterval = setInterval(() => {
       fetchEntries();
-    }, 2000);
+    }, 4000);
 
     // Setup SSE connection safely for real-time director/operator updates
     let eventSource: EventSource | null = null;

@@ -38,17 +38,17 @@ if (dbUrl) {
 }
 
 // Global Cloud Storage Fallback (JsonBlob) for zero-config cross-device sync
-let cloudBlobUrl = process.env.CLOUD_BLOB_URL || 'https://jsonblob.com/api/jsonBlob/1332408976214552576';
+const FIXED_CLOUD_BLOB_URL = process.env.CLOUD_BLOB_URL || 'https://jsonblob.com/api/jsonBlob/1332408976214552576';
 
 const readCloudFallback = async (): Promise<BalaEntry[] | null> => {
   try {
-    const res = await fetch(cloudBlobUrl, {
+    const res = await fetch(FIXED_CLOUD_BLOB_URL, {
       headers: { 'Accept': 'application/json' },
       signal: AbortSignal.timeout(4000)
     });
     if (res.ok) {
       const data = await res.json();
-      if (Array.isArray(data) && data.length > 0) {
+      if (Array.isArray(data)) {
         return data;
       }
     }
@@ -60,7 +60,7 @@ const readCloudFallback = async (): Promise<BalaEntry[] | null> => {
 
 const writeCloudFallback = async (data: BalaEntry[]): Promise<void> => {
   try {
-    const res = await fetch(cloudBlobUrl, {
+    await fetch(FIXED_CLOUD_BLOB_URL, {
       method: 'PUT',
       headers: { 
         'Content-Type': 'application/json',
@@ -69,20 +69,6 @@ const writeCloudFallback = async (data: BalaEntry[]): Promise<void> => {
       body: JSON.stringify(data),
       signal: AbortSignal.timeout(5000)
     });
-    if (!res.ok) {
-      const postRes = await fetch('https://jsonblob.com/api/jsonBlob', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Accept': 'application/json' 
-        },
-        body: JSON.stringify(data),
-        signal: AbortSignal.timeout(5000)
-      });
-      if (postRes.ok && postRes.headers.get('Location')) {
-        cloudBlobUrl = postRes.headers.get('Location')!;
-      }
-    }
   } catch (e) {
     console.warn('Cloud JsonBlob write error:', e);
   }
@@ -188,14 +174,23 @@ const getInitialData = (): BalaEntry[] => {
 };
 
 let memoryEntriesCache: BalaEntry[] | null = null;
+let lastCacheTime = 0;
+const CACHE_TTL_MS = 6000; // 6 seconds in-memory cache TTL
 
 const readDB = async (): Promise<BalaEntry[]> => {
-  // 1. Try Vercel KV / Upstash Redis
+  const now = Date.now();
+  // 1. Return in-memory cache if fresh
+  if (memoryEntriesCache !== null && (now - lastCacheTime < CACHE_TTL_MS)) {
+    return memoryEntriesCache;
+  }
+
+  // 2. Try Vercel KV / Upstash Redis
   if (redisClient) {
     try {
       const data = await redisClient.get<BalaEntry[]>('bale_entries');
       if (Array.isArray(data)) {
         memoryEntriesCache = data;
+        lastCacheTime = now;
         return data;
       }
     } catch (e) {
@@ -203,7 +198,7 @@ const readDB = async (): Promise<BalaEntry[]> => {
     }
   }
 
-  // 2. Try Vercel Postgres / Neon
+  // 3. Try Vercel Postgres / Neon
   if (pgPool) {
     try {
       await pgPool.query(`
@@ -215,6 +210,7 @@ const readDB = async (): Promise<BalaEntry[]> => {
       const res = await pgPool.query(`SELECT value FROM bale_store WHERE key = 'bale_entries'`);
       if (res.rows.length > 0 && Array.isArray(res.rows[0].value)) {
         memoryEntriesCache = res.rows[0].value;
+        lastCacheTime = now;
         return res.rows[0].value;
       }
     } catch (e) {
@@ -222,18 +218,20 @@ const readDB = async (): Promise<BalaEntry[]> => {
     }
   }
 
-  // 3. Try Cloud Storage Fallback (JsonBlob)
+  // 4. Try Cloud Storage Fallback (JsonBlob)
   const cloudData = await readCloudFallback();
-  if (cloudData && Array.isArray(cloudData) && cloudData.length > 0) {
+  if (cloudData && Array.isArray(cloudData)) {
     memoryEntriesCache = cloudData;
+    lastCacheTime = now;
     return cloudData;
   }
 
-  // 4. Fallback to memory cache or local filesystem
+  // 5. Fallback to existing memory cache if available
   if (memoryEntriesCache !== null) {
     return memoryEntriesCache;
   }
 
+  // 6. Fallback to local filesystem /tmp or ./data
   try {
     const tmpFile = path.join('/tmp', 'lalinea_db.json');
     if (fs.existsSync(tmpFile)) {
@@ -241,6 +239,7 @@ const readDB = async (): Promise<BalaEntry[]> => {
       const parsed = JSON.parse(content);
       if (Array.isArray(parsed)) {
         memoryEntriesCache = parsed;
+        lastCacheTime = now;
         return parsed;
       }
     }
@@ -254,6 +253,7 @@ const readDB = async (): Promise<BalaEntry[]> => {
       const parsed = JSON.parse(content);
       if (Array.isArray(parsed)) {
         memoryEntriesCache = parsed;
+        lastCacheTime = now;
         return parsed;
       }
     }
@@ -263,12 +263,14 @@ const readDB = async (): Promise<BalaEntry[]> => {
 
   const initialData = getInitialData();
   memoryEntriesCache = initialData;
+  lastCacheTime = now;
   await writeDB(initialData);
   return initialData;
 };
 
 const writeDB = async (data: BalaEntry[]): Promise<void> => {
   memoryEntriesCache = data;
+  lastCacheTime = Date.now();
 
   // 1. Write to Vercel KV / Upstash Redis
   if (redisClient) {
@@ -353,6 +355,22 @@ app.post('/api/auth/login', (req, res) => {
   }
   
   return res.json({ name: String(name).trim(), role: 'operator' });
+});
+
+// DB Status Endpoint
+app.get('/api/db-status', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
+  let type = 'memory_local';
+  if (pgPool) type = 'vercel_postgres';
+  else if (redisClient) type = 'vercel_kv';
+  else type = 'json_cloud_blob';
+
+  res.json({
+    connected: true,
+    dbType: type,
+    hasPostgres: Boolean(pgPool),
+    hasKv: Boolean(redisClient),
+  });
 });
 
 // SSE event source for real-time synchronization
