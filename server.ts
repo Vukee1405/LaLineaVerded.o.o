@@ -2,15 +2,97 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
+import { Redis } from '@upstash/redis';
+import pg from 'pg';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const DB_DIR = path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
 
-// Ensure database file and directory exist
+// Cloud Database clients (Vercel KV / Upstash Redis or Vercel Postgres / Neon)
+let redisClient: Redis | null = null;
+const kvUrl = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const kvToken = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+if (kvUrl && kvToken) {
+  try {
+    redisClient = new Redis({ url: kvUrl, token: kvToken });
+  } catch (e) {
+    console.warn('Failed to initialize Redis client:', e);
+  }
+}
+
+let pgPool: pg.Pool | null = null;
+const dbUrl = process.env.POSTGRES_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL_NON_POOLING;
+if (dbUrl) {
+  try {
+    pgPool = new pg.Pool({
+      connectionString: dbUrl,
+      ssl: dbUrl.includes('localhost') ? false : { rejectUnauthorized: false },
+      max: 5,
+      connectionTimeoutMillis: 5000,
+    });
+  } catch (e) {
+    console.warn('Failed to initialize Postgres pool:', e);
+  }
+}
+
+// Global Cloud Storage Fallback (JsonBlob) for zero-config cross-device sync
+let cloudBlobUrl = process.env.CLOUD_BLOB_URL || 'https://jsonblob.com/api/jsonBlob/1332408976214552576';
+
+const readCloudFallback = async (): Promise<BalaEntry[] | null> => {
+  try {
+    const res = await fetch(cloudBlobUrl, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(4000)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        return data;
+      }
+    }
+  } catch (e) {
+    console.warn('Cloud JsonBlob read error:', e);
+  }
+  return null;
+};
+
+const writeCloudFallback = async (data: BalaEntry[]): Promise<void> => {
+  try {
+    const res = await fetch(cloudBlobUrl, {
+      method: 'PUT',
+      headers: { 
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(data),
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!res.ok) {
+      const postRes = await fetch('https://jsonblob.com/api/jsonBlob', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json' 
+        },
+        body: JSON.stringify(data),
+        signal: AbortSignal.timeout(5000)
+      });
+      if (postRes.ok && postRes.headers.get('Location')) {
+        cloudBlobUrl = postRes.headers.get('Location')!;
+      }
+    }
+  } catch (e) {
+    console.warn('Cloud JsonBlob write error:', e);
+  }
+};
+
+// Ensure database file and directory exist locally
 if (!fs.existsSync(DB_DIR)) {
-  fs.mkdirSync(DB_DIR, { recursive: true });
+  try {
+    fs.mkdirSync(DB_DIR, { recursive: true });
+  } catch (e) {}
 }
 
 interface BalaEntry {
@@ -107,7 +189,47 @@ const getInitialData = (): BalaEntry[] => {
 
 let memoryEntriesCache: BalaEntry[] | null = null;
 
-const readDB = (): BalaEntry[] => {
+const readDB = async (): Promise<BalaEntry[]> => {
+  // 1. Try Vercel KV / Upstash Redis
+  if (redisClient) {
+    try {
+      const data = await redisClient.get<BalaEntry[]>('bale_entries');
+      if (Array.isArray(data)) {
+        memoryEntriesCache = data;
+        return data;
+      }
+    } catch (e) {
+      console.warn('Vercel KV read error:', e);
+    }
+  }
+
+  // 2. Try Vercel Postgres / Neon
+  if (pgPool) {
+    try {
+      await pgPool.query(`
+        CREATE TABLE IF NOT EXISTS bale_store (
+          key TEXT PRIMARY KEY,
+          value JSONB NOT NULL
+        )
+      `);
+      const res = await pgPool.query(`SELECT value FROM bale_store WHERE key = 'bale_entries'`);
+      if (res.rows.length > 0 && Array.isArray(res.rows[0].value)) {
+        memoryEntriesCache = res.rows[0].value;
+        return res.rows[0].value;
+      }
+    } catch (e) {
+      console.warn('Postgres read error:', e);
+    }
+  }
+
+  // 3. Try Cloud Storage Fallback (JsonBlob)
+  const cloudData = await readCloudFallback();
+  if (cloudData && Array.isArray(cloudData) && cloudData.length > 0) {
+    memoryEntriesCache = cloudData;
+    return cloudData;
+  }
+
+  // 4. Fallback to memory cache or local filesystem
   if (memoryEntriesCache !== null) {
     return memoryEntriesCache;
   }
@@ -141,27 +263,55 @@ const readDB = (): BalaEntry[] => {
 
   const initialData = getInitialData();
   memoryEntriesCache = initialData;
-  writeDB(initialData);
+  await writeDB(initialData);
   return initialData;
 };
 
-const writeDB = (data: BalaEntry[]) => {
+const writeDB = async (data: BalaEntry[]): Promise<void> => {
   memoryEntriesCache = data;
 
+  // 1. Write to Vercel KV / Upstash Redis
+  if (redisClient) {
+    try {
+      await redisClient.set('bale_entries', data);
+    } catch (e) {
+      console.error('Vercel KV write error:', e);
+    }
+  }
+
+  // 2. Write to Vercel Postgres / Neon
+  if (pgPool) {
+    try {
+      await pgPool.query(`
+        CREATE TABLE IF NOT EXISTS bale_store (
+          key TEXT PRIMARY KEY,
+          value JSONB NOT NULL
+        )
+      `);
+      await pgPool.query(
+        `INSERT INTO bale_store (key, value) VALUES ('bale_entries', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+        [JSON.stringify(data)]
+      );
+    } catch (e) {
+      console.error('Postgres write error:', e);
+    }
+  }
+
+  // 3. Write to Cloud Storage Fallback (JsonBlob)
+  await writeCloudFallback(data);
+
+  // 4. Local disk fallback
   try {
     fs.writeFileSync(path.join('/tmp', 'lalinea_db.json'), JSON.stringify(data, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('Error writing to /tmp/lalinea_db.json:', e);
-  }
+  } catch (e) {}
 
   try {
     if (!fs.existsSync(DB_DIR)) {
       fs.mkdirSync(DB_DIR, { recursive: true });
     }
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('Error writing to ./data/db.json:', e);
-  }
+  } catch (e) {}
 
   notifyClients();
 };
@@ -175,7 +325,7 @@ const notifyClients = () => {
     try {
       client.write(message);
     } catch (e) {
-      // Ignore write errors, they will be removed on close
+      // Ignore write errors
     }
   });
 };
@@ -202,7 +352,6 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(400).json({ error: 'Ime operatera je obavezno' });
   }
   
-  // Accept any operator login with name
   return res.json({ name: String(name).trim(), role: 'operator' });
 });
 
@@ -223,11 +372,11 @@ app.get('/api/realtime', (req, res) => {
 });
 
 // Get all entries
-app.get('/api/entries', (req, res) => {
+app.get('/api/entries', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  const entries = readDB();
+  const entries = await readDB();
   const sorted = entries.sort((a, b) => {
     const dateComp = b.datum.localeCompare(a.datum);
     if (dateComp !== 0) return dateComp;
@@ -237,13 +386,13 @@ app.get('/api/entries', (req, res) => {
 });
 
 // Batch sync endpoint for offline/client entries
-app.post('/api/entries/sync', (req, res) => {
+app.post('/api/entries/sync', async (req, res) => {
   const clientEntries = req.body.entries;
   if (!Array.isArray(clientEntries)) {
     return res.status(400).json({ error: 'Nevaljali format za sinhronizaciju' });
   }
 
-  const currentDb = readDB();
+  const currentDb = await readDB();
   let modified = false;
 
   clientEntries.forEach((item: BalaEntry) => {
@@ -272,7 +421,7 @@ app.post('/api/entries/sync', (req, res) => {
   });
 
   if (modified) {
-    writeDB(currentDb);
+    await writeDB(currentDb);
   }
 
   const sorted = currentDb.sort((a, b) => {
@@ -285,7 +434,7 @@ app.post('/api/entries/sync', (req, res) => {
 });
 
 // Create entry
-app.post('/api/entries', (req, res) => {
+app.post('/api/entries', async (req, res) => {
   const { id, datum, vrsta, tezina, napomena, korisnik, vremeUnosa } = req.body;
   
   if (!datum || !vrsta || !tezina) {
@@ -307,7 +456,7 @@ app.post('/api/entries', (req, res) => {
     vremeUnosa: vremeUnosa || new Date().toISOString()
   };
 
-  const entries = readDB();
+  const entries = await readDB();
   const existingIndex = entries.findIndex(e => e.id === newEntry.id);
   if (existingIndex >= 0) {
     entries[existingIndex] = newEntry;
@@ -315,17 +464,17 @@ app.post('/api/entries', (req, res) => {
     entries.push(newEntry);
   }
 
-  writeDB(entries);
+  await writeDB(entries);
 
   res.status(201).json(newEntry);
 });
 
 // Edit entry
-app.put('/api/entries/:id', (req, res) => {
+app.put('/api/entries/:id', async (req, res) => {
   const { id } = req.params;
   const { datum, vrsta, tezina, napomena, korisnik } = req.body;
 
-  let entries = readDB();
+  let entries = await readDB();
   const index = entries.findIndex(e => e.id === id);
   if (index === -1) {
     return res.status(404).json({ error: 'Unos nije pronadjen' });
@@ -343,24 +492,22 @@ app.put('/api/entries/:id', (req, res) => {
   if (vrsta) entries[index].vrsta = vrsta;
   if (napomena !== undefined) entries[index].napomena = napomena;
   if (korisnik) entries[index].korisnik = korisnik;
-  
-  // Keep same vremeUnosa or update it? Keep same to preserve original timestamp, but we can log change time in a real system.
 
-  writeDB(entries);
+  await writeDB(entries);
   res.json(entries[index]);
 });
 
 // Delete entry
-app.delete('/api/entries/:id', (req, res) => {
+app.delete('/api/entries/:id', async (req, res) => {
   const { id } = req.params;
-  const entries = readDB();
+  const entries = await readDB();
   const filtered = entries.filter(e => e.id !== id);
   
   if (filtered.length === entries.length) {
     return res.status(404).json({ error: 'Unos nije pronadjen' });
   }
 
-  writeDB(filtered);
+  await writeDB(filtered);
   res.json({ success: true, id });
 });
 
