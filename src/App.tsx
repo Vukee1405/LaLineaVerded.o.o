@@ -6,6 +6,7 @@ import { EntryForm } from './components/EntryForm';
 import { HistoryList } from './components/HistoryList';
 import { MonthlyOverview } from './components/MonthlyOverview';
 import { InstallPrompt } from './components/InstallPrompt';
+import { QrModal } from './components/QrModal';
 import { BalaEntry, VrstaBale } from './types';
 import { AlertCircle, RefreshCw } from 'lucide-react';
 
@@ -13,6 +14,8 @@ export default function App() {
   const [operatorName, setOperatorName] = useState<string | null>(() => {
     return localStorage.getItem('llv_operator_name');
   });
+
+  const [isQrOpen, setIsQrOpen] = useState(false);
 
   const [currentView, setCurrentViewState] = useState<'home' | 'new-entry' | 'history' | 'monthly'>(() => {
     try {
@@ -125,11 +128,8 @@ export default function App() {
         }
       }
 
-      // Master list merges localCache, serverEntries, and pendingSync
+      // Master list merges serverEntries and pendingSync (localCache is for offline fallback only)
       const entryMap = new Map<string, BalaEntry>();
-      localCache.forEach((item) => {
-        if (item && item.id && !deletedIds.has(item.id)) entryMap.set(item.id, item);
-      });
       serverEntries.forEach((item) => {
         if (item && item.id && !deletedIds.has(item.id)) entryMap.set(item.id, item);
       });
@@ -435,7 +435,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col pb-24 relative">
-      <Header operatorName={operatorName} onLogout={handleLogout} onRefresh={fetchEntries} />
+      <Header 
+        operatorName={operatorName} 
+        onLogout={handleLogout} 
+        onRefresh={fetchEntries}
+        onOpenQr={() => setIsQrOpen(true)}
+      />
 
       {/* Persistent Connection Status Warning (Non-intrusive) */}
       {error && (
@@ -453,6 +458,9 @@ export default function App() {
 
       {/* PWA Install prompt toast */}
       <InstallPrompt />
+
+      {/* QR Code Modal for Mobile Sharing */}
+      <QrModal isOpen={isQrOpen} onClose={() => setIsQrOpen(false)} />
     </div>
   );
 }

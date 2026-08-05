@@ -1,7 +1,6 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import { createServer as createViteServer } from 'vite';
 import { Redis } from '@upstash/redis';
 import pg from 'pg';
 
@@ -38,40 +37,89 @@ if (dbUrl) {
 }
 
 // Global Cloud Storage Fallback (JsonBlob) for zero-config cross-device sync
-const FIXED_CLOUD_BLOB_URL = process.env.CLOUD_BLOB_URL || 'https://jsonblob.com/api/jsonBlob/1332408976214552576';
+let activeCloudBlobUrl = process.env.CLOUD_BLOB_URL || 'https://jsonblob.com/api/jsonBlob/019fccc1-778d-713f-9540-a189550b3fc3';
 
 const readCloudFallback = async (): Promise<BalaEntry[] | null> => {
-  try {
-    const res = await fetch(FIXED_CLOUD_BLOB_URL, {
-      headers: { 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(4000)
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        return data;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const url = `${activeCloudBlobUrl}?t=${Date.now()}`;
+      const res = await fetch(url, {
+        headers: { 
+          'Accept': 'application/json',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache'
+        },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(4000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          return data;
+        }
+      } else if (res.status === 404) {
+        console.warn('Cloud JsonBlob returned 404');
+        return null;
       }
+    } catch (e) {
+      console.warn(`Cloud JsonBlob read attempt ${attempt} error:`, e);
     }
-  } catch (e) {
-    console.warn('Cloud JsonBlob read error:', e);
   }
   return null;
 };
 
-const writeCloudFallback = async (data: BalaEntry[]): Promise<void> => {
+const createNewCloudBlob = async (data: BalaEntry[]): Promise<boolean> => {
   try {
-    await fetch(FIXED_CLOUD_BLOB_URL, {
-      method: 'PUT',
-      headers: { 
+    const createRes = await fetch('https://jsonblob.com/api/jsonBlob', {
+      method: 'POST',
+      headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
       },
       body: JSON.stringify(data),
       signal: AbortSignal.timeout(5000)
     });
+    if (createRes.ok) {
+      const location = createRes.headers.get('location') || createRes.headers.get('Location');
+      const blobId = createRes.headers.get('x-jsonblob-id');
+      if (location) {
+        activeCloudBlobUrl = location.startsWith('http') ? location : `https://jsonblob.com${location}`;
+      } else if (blobId) {
+        activeCloudBlobUrl = `https://jsonblob.com/api/jsonBlob/${blobId}`;
+      }
+      try {
+        fs.writeFileSync('/tmp/active_blob_url.txt', activeCloudBlobUrl, 'utf-8');
+      } catch (e) {}
+      return true;
+    }
   } catch (e) {
-    console.warn('Cloud JsonBlob write error:', e);
+    console.warn('Failed to create new Cloud JsonBlob:', e);
   }
+  return false;
+};
+
+const writeCloudFallback = async (data: BalaEntry[]): Promise<boolean> => {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(activeCloudBlobUrl, {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Cache-Control': 'no-cache'
+        },
+        body: JSON.stringify(data),
+        signal: AbortSignal.timeout(5000)
+      });
+      if (res.ok) return true;
+      if (res.status === 404) {
+        return await createNewCloudBlob(data);
+      }
+    } catch (e) {
+      console.warn(`Cloud JsonBlob write attempt ${attempt} error:`, e);
+    }
+  }
+  return false;
 };
 
 // Ensure database file and directory exist locally
@@ -175,7 +223,7 @@ const getInitialData = (): BalaEntry[] => {
 
 let memoryEntriesCache: BalaEntry[] | null = null;
 let lastCacheTime = 0;
-const CACHE_TTL_MS = 6000; // 6 seconds in-memory cache TTL
+const CACHE_TTL_MS = 200; // 0.2 seconds in-memory cache TTL for instant multi-instance responsiveness
 
 const readDB = async (): Promise<BalaEntry[]> => {
   const now = Date.now();
@@ -218,54 +266,52 @@ const readDB = async (): Promise<BalaEntry[]> => {
     }
   }
 
-  // 4. Try Cloud Storage Fallback (JsonBlob)
+  // 4. Try Cloud Storage Fallback (JsonBlob) for global cross-device synchronization
   const cloudData = await readCloudFallback();
-  if (cloudData && Array.isArray(cloudData)) {
+  if (cloudData !== null && Array.isArray(cloudData)) {
     memoryEntriesCache = cloudData;
     lastCacheTime = now;
     return cloudData;
   }
 
-  // 5. Fallback to existing memory cache if available
-  if (memoryEntriesCache !== null) {
-    return memoryEntriesCache;
-  }
-
-  // 6. Fallback to local filesystem /tmp or ./data
+  // 5. Try local filesystem /tmp or ./data as offline fallback
+  let fallbackData: BalaEntry[] | null = null;
   try {
     const tmpFile = path.join('/tmp', 'lalinea_db.json');
     if (fs.existsSync(tmpFile)) {
       const content = fs.readFileSync(tmpFile, 'utf-8');
       const parsed = JSON.parse(content);
-      if (Array.isArray(parsed)) {
-        memoryEntriesCache = parsed;
-        lastCacheTime = now;
-        return parsed;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        fallbackData = parsed;
       }
     }
-  } catch (e) {
-    console.warn('Error reading /tmp/lalinea_db.json:', e);
+  } catch (e) {}
+
+  if (!fallbackData && memoryEntriesCache !== null) {
+    fallbackData = memoryEntriesCache;
   }
 
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const content = fs.readFileSync(DB_FILE, 'utf-8');
-      const parsed = JSON.parse(content);
-      if (Array.isArray(parsed)) {
-        memoryEntriesCache = parsed;
-        lastCacheTime = now;
-        return parsed;
+  if (!fallbackData) {
+    try {
+      if (fs.existsSync(DB_FILE)) {
+        const content = fs.readFileSync(DB_FILE, 'utf-8');
+        const parsed = JSON.parse(content);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          fallbackData = parsed;
+        }
       }
+    } catch (e) {
+      console.warn('Error reading ./data/db.json:', e);
     }
-  } catch (e) {
-    console.warn('Error reading ./data/db.json:', e);
   }
 
-  const initialData = getInitialData();
-  memoryEntriesCache = initialData;
+  const finalData = fallbackData || getInitialData();
+  memoryEntriesCache = finalData;
   lastCacheTime = now;
-  await writeDB(initialData);
-  return initialData;
+  
+  // Seed cloud storage asynchronously with existing or initial data
+  createNewCloudBlob(finalData).catch(() => {});
+  return finalData;
 };
 
 const writeDB = async (data: BalaEntry[]): Promise<void> => {
@@ -300,7 +346,7 @@ const writeDB = async (data: BalaEntry[]): Promise<void> => {
     }
   }
 
-  // 3. Write to Cloud Storage Fallback (JsonBlob)
+  // 3. AWAIT Write to Cloud Storage Fallback (JsonBlob) for instant cross-device availability
   await writeCloudFallback(data);
 
   // 4. Local disk fallback
@@ -532,13 +578,14 @@ app.delete('/api/entries/:id', async (req, res) => {
 async function startServer() {
   // Vite dev server middleware integration
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
 
-    app.use('*', async (req, res, next) => {
+    app.get('*', async (req, res, next) => {
       if (req.originalUrl.startsWith('/api')) {
         return next();
       }

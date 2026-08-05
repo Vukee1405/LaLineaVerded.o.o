@@ -1,13 +1,14 @@
 import React from 'react';
-import { LogOut, User, Calendar, RefreshCw } from 'lucide-react';
+import { LogOut, User, Calendar, RefreshCw, Smartphone } from 'lucide-react';
 
 interface HeaderProps {
   operatorName: string;
   onLogout: () => void;
   onRefresh?: () => void;
+  onOpenQr?: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({ operatorName, onLogout, onRefresh }) => {
+export const Header: React.FC<HeaderProps> = ({ operatorName, onLogout, onRefresh, onOpenQr }) => {
   const getFormattedDate = () => {
     const d = new Date();
     const days = ['Nedelja', 'Ponedeljak', 'Utorak', 'Sreda', 'Četvrtak', 'Petak', 'Subota'];
@@ -36,15 +37,26 @@ export const Header: React.FC<HeaderProps> = ({ operatorName, onLogout, onRefres
             </div>
           </div>
 
-          {onRefresh && (
-            <button
-              onClick={onRefresh}
-              className="sm:hidden flex items-center justify-center p-2 bg-white/15 hover:bg-white/25 rounded-lg border border-white/20 active:scale-95 transition-all text-white"
-              title="Sinhronizuj bazu podataka"
-            >
-              <RefreshCw className="w-4 h-4" />
-            </button>
-          )}
+          <div className="flex items-center gap-1.5 sm:hidden">
+            {onOpenQr && (
+              <button
+                onClick={onOpenQr}
+                className="flex items-center justify-center p-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg border border-white/20 active:scale-95 transition-all"
+                title="Prikaži QR kod za telefone"
+              >
+                <Smartphone className="w-4 h-4" />
+              </button>
+            )}
+            {onRefresh && (
+              <button
+                onClick={onRefresh}
+                className="flex items-center justify-center p-2 bg-white/15 hover:bg-white/25 rounded-lg border border-white/20 active:scale-95 transition-all text-white"
+                title="Sinhronizuj bazu podataka"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-3 w-full sm:w-auto">
@@ -53,6 +65,18 @@ export const Header: React.FC<HeaderProps> = ({ operatorName, onLogout, onRefres
             <Calendar className="w-3.5 h-3.5 text-white/70" />
             <span>{getFormattedDate()}</span>
           </div>
+
+          {/* QR Code Button */}
+          {onOpenQr && (
+            <button
+              onClick={onOpenQr}
+              className="hidden sm:flex items-center gap-1.5 bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-3 py-1.5 rounded-full text-xs transition-all active:scale-95 border border-white/20 shadow-sm"
+              title="Prikaži QR kod za instalaciju na telefone"
+            >
+              <Smartphone className="w-3.5 h-3.5" />
+              <span>QR Kod Telefon</span>
+            </button>
+          )}
 
           {/* Refresh Button on desktop */}
           {onRefresh && (
